@@ -20,6 +20,8 @@ once Zuul has its GitHub connection (#1344) and build nodes (#1345) ([On Thunder
 | [`gate.md`](gate.md) | how `check`, `gate` and `hold` do what CI's two layers and Mergify do today, row by row | |
 | [`comparison.md`](comparison.md) | ordinary-run comparison with Actions/Mergify, reporting times and remaining coverage/rollout gaps (#1353) | |
 | [`publish.md`](publish.md) | `post` and the periodic pipelines: the app images, AID's release, the release index and the nightly on Zuul, which CI publishes (`ci/publisher`), and turning it on (#1350) | |
+| [`forge.md`](forge.md) | what moving from GitHub to another forge would touch, with Zuul staying, and one merge request through check and gate on GitLab (#1356) | |
+| [`testbed/gitlab/`](testbed/gitlab) | Zuul on GitLab CE, in Docker Compose: the pipelines' GitLab form and that merge request ([forge.md](forge.md), "The check on GitLab") | |
 | [`publish/`](publish) | the scripts those jobs run: aid-zuul-config's publishing jobs, and the nightly | runs on the pull request's own jobs only where one names it (`aid-nightly`); aid-zuul-config's jobs run `main`'s |
 
 ## Trusted and untrusted

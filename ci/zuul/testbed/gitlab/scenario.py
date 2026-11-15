@@ -175,9 +175,13 @@ def setup(args):
         for user, level in members[project].items():
             gitlab.call("POST", f"/projects/{created['id']}/members", {"user_id": users[user], "access_level": level})
         push(gitlab, directory, project)
-        # main is protected on the first push (Maintainers push and merge), which exclude-unprotected-branches needs.
+        # main protected, Maintainers alone pushing and merging, which exclude-unprotected-branches needs. GitLab 19
+        # does not protect it on the first push.
         branch = gitlab.call("GET", f"{gitlab.project(project)}/repository/branches/main")
         if not branch.get("protected"):
+            gitlab.call("POST", f"{gitlab.project(project)}/protected_branches",
+                        {"name": "main", "push_access_level": 40, "merge_access_level": 40})
+        if not gitlab.call("GET", f"{gitlab.project(project)}/repository/branches/main").get("protected"):
             raise Failure(f"{project}: main is not protected")
         if project == PROJECT:
             for label, color in LABELS.items():
