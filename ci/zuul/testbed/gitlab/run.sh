@@ -23,9 +23,10 @@ logs() {
   "${compose[@]}" logs --no-color --timestamps --tail 200 gitlab || true
   echo "== the failed builds' output"
   # shellcheck disable=SC2016 # expanded in the executor's shell
-  "${compose[@]}" exec -T executor sh -c 'for output in /var/lib/zuul/builds/*/work/logs/job-output.txt; do
-      grep -qE "FAILED|fatal:|failed=[1-9]|unreachable=[1-9]" "$output" || continue
-      echo "--- $output"; tail -n 60 "$output"
+  "${compose[@]}" exec -T executor sh -c 'ls /var/lib/zuul/builds
+    for output in /var/lib/zuul/builds/*/work/logs/job-output.txt; do
+      grep -qE "FAILED|fatal:|failed=[1-9]|unreachable=[1-9]|ERROR" "$output" || continue
+      echo "--- $output"; grep -nE -B2 -A12 "FAILED|fatal:|ERROR" "$output" | tail -n 80
     done' 2>&1 || true
 }
 finish() {
@@ -61,6 +62,9 @@ unpack zookeeper-tls keystore.pem "$work/zookeeper-tls/keystore.pem"
 unpack zookeeper-tls ca.crt "$work/zookeeper-tls/ca.crt"
 for key in tls.crt tls.key ca.crt; do unpack zuul-zookeeper-client "$key" "$work/client-tls/$key"; done
 chmod -R a+rX "$work/zookeeper-tls" "$work/client-tls"
+# The log store the base job's post-run writes into (deploy/zuul/executor/store-logs.sh), from inside the executor's
+# bubblewrap, whose user is not the runner's: writable by anyone, as only the run's builds write there (#1540).
+chmod 1777 "$work/logs"
 ssh-keygen -q -t ed25519 -N '' -C zuul-gitlab-testbed -f "$work/ssh/id_rsa"
 chmod 644 "$work/ssh/id_rsa.pub"
 
