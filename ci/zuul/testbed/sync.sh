@@ -31,7 +31,7 @@ testbed_repository=$(repository_of "$dest")
 
 find "$dest" "$config_dest" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 (cd "$config" && find . -mindepth 1 -maxdepth 1 ! -name .git -exec cp -R {} "$config_dest/" \;)
-# Compose's node replaces the production k3s provider for the same aid-node label. Keep the
+# Compose's node replaces the production k3s provider for the same aid-check-pod-node label. Keep the
 # production base job and playbooks; its real provider is tested on k3s, not Compose. The pipeline
 # changes for the workflow's token are below.
 rm -f "$config_dest/zuul.d/providers.yaml"
@@ -50,8 +50,9 @@ done < <(grep -rlE '^- secret:|^ +secrets:' "$config_dest/zuul.d" || true)
 # error in its summary; a status cannot, so each failure reporter comments too, as main's did before check runs, and
 # the scenario's negative cases read the error from that comment. gate's requirement and trigger on check's check run
 # become the same on check's status, which GitHub shows as made by github-actions[bot] (its REST API) or
-# github-actions (its GraphQL API, which Zuul reads the requirement from). aid-zuul-config's own files keep check runs
-# and the permission (AIDepartment's deploy/zuul/github.md); every change must apply, or the copy stops.
+# github-actions (its GraphQL API, which Zuul reads the requirement from). A status has no cancelled or skipped, so
+# dequeue and no-jobs leave it as it was (#1660). aid-zuul-config's own files keep check runs and the permission
+# (AIDepartment's deploy/zuul/github.md); every change must apply, or the copy stops.
 pipelines="$config_dest/zuul.d/pipelines.yaml"
 # Keep the original before removing permissions for the workflow token. run.sh
 # checks its schema and gate's review filters with the pinned scheduler's driver.
@@ -66,7 +67,7 @@ TESTBED_CHECK_STATUS="'github-actions(\\[bot\\])?:aid/check:success'" awk '
   /^ +check: (in_progress|queued)$/ { sub(/check: .*/, "status: pending"); print; next }
   /^ +check: success$/ { sub(/check: success/, "status: success"); print; next }
   /^ +check: failure$/ { sub(/check: failure/, "status: failure"); print; failed = 1; next }
-  /^ +check: cancelled$/ || /^ +permission: write$/ { next }
+  /^ +check: (cancelled|skipped)$/ || /^ +permission: write$/ { next }
   failed && /^ +comment: false$/ { sub(/false/, "true") }
   /^ +comment: / { failed = 0 }
   { print }
@@ -103,6 +104,8 @@ mkdir -p "$dest/ci" "$dest/deploy/zuul/server/config" "$dest/deploy/zuul/executo
 cp -R "$root/ci/zuul" "$dest/ci/zuul"
 mv "$pipelines.original" "$dest/ci/zuul/testbed/original-pipelines.yaml"
 cp "$root/deploy/zuul/server/config/zuul.conf" "$dest/deploy/zuul/server/config/"
+mkdir -p "$dest/deploy/zuul/server/launcher"
+cp "$root/deploy/zuul/server/launcher/"*.py "$dest/deploy/zuul/server/launcher/"
 cp "$root/deploy/zuul/server/zoo.cfg" "$dest/deploy/zuul/server/"
 cp "$root/deploy/zuul/secrets.sh" "$dest/deploy/zuul/"
 cp "$root/deploy/zuul/executor/store-logs.sh" "$dest/deploy/zuul/executor/"
@@ -115,6 +118,12 @@ for script in $scripts; do
   printf '%s\n' '#!/usr/bin/env bash' \
     "# The test bed's stand-in for AIDepartment's $script: it shows only that its job ran it." \
     "echo \"stand-in for $script, called with: \$*\"" > "$dest/$script"
+  # The gate's plan (ci/zuul/gate.sh plan) names the full job alone: gate runs it, and Zuul skips its other jobs, which
+  # need nodes the test bed has not (testbed/providers.yaml).
+  if [ "$script" = ci/zuul/gate.sh ]; then
+    # shellcheck disable=SC2016 # the stand-in's own text
+    printf '%s\n' '[ "${3:-}" != plan ] || { mkdir -p ~/zuul-output/logs; echo '"'"'{"child_jobs": ["aid-bazel-everything"]}'"'"' > ~/zuul-output/logs/gate-plan.json; }' >> "$dest/$script"
+  fi
   chmod 755 "$dest/$script"
 done
 # The test bed's jobs with a secret (secret-probe.yaml), with the shared guard of aid-zuul-config's checkout: a

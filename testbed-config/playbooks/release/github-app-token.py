@@ -7,6 +7,13 @@ object with what it found, and never the key, the JWT or the token. On a failure
 
     python3 github-app-token.py --app-id ID --repository OWNER/NAME --permission contents=write --key-file key.pem
 
+For a job that uses the token (AIDepartment#1350, zuul.d/publish.yaml), --keep FILE makes and checks it as above, and
+writes it to FILE (mode 0600) instead of revoking it; --revoke FILE revokes the token in FILE and removes the file. The
+token lasts an hour at most, so each playbook that uses one makes its own and revokes it when it ends.
+
+    python3 github-app-token.py --app-id ID --repository OWNER/NAME --permission contents=write --key-file key.pem --keep token
+    python3 github-app-token.py --revoke token
+
 Standard library and cryptography only (Ansible's own dependency). Reaches api.github.com through the environment's
 https_proxy, as the executor does.
 """
@@ -15,6 +22,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -57,14 +65,23 @@ def call(method, path, auth, body=None, ok=(200,)):
 def main():
     global API
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--app-id", required=True)
-    parser.add_argument("--repository", required=True)
-    parser.add_argument("--permission", action="append", required=True, help="NAME=read|write, as GitHub names them")
+    parser.add_argument("--app-id")
+    parser.add_argument("--repository")
+    parser.add_argument("--permission", action="append", help="NAME=read|write, as GitHub names them")
     parser.add_argument("--key-file", help="the App's private key, PEM; without it, read from stdin")
+    parser.add_argument("--keep", metavar="FILE", help="write the checked token to FILE, and do not revoke it")
+    parser.add_argument("--revoke", metavar="FILE", help="revoke the token in FILE, and remove FILE")
     # Only for testing it against a stand-in for GitHub.
     parser.add_argument("--api", default=API, help=argparse.SUPPRESS)
     args = parser.parse_args()
     API = args.api.rstrip("/")
+    if args.revoke:
+        if args.app_id or args.repository or args.permission or args.key_file or args.keep:
+            raise Failure("--revoke takes nothing else")
+        revoke(args.revoke)
+        return
+    if not (args.app_id and args.repository and args.permission):
+        raise Failure("--app-id, --repository and --permission are required")
     if not args.app_id.isdigit():
         raise Failure("--app-id must be the App's number")
     owner, _, name = args.repository.partition("/")
@@ -94,6 +111,7 @@ def main():
                 body={"repositories": [name], "permissions": permissions}, ok=(201,))
     token = made["token"]
     revoked = False
+    kept = False
     try:
         granted = {k: v for k, v in made.get("permissions", {}).items() if k != "metadata"}
         repositories = [r["full_name"] for r in made.get("repositories", [])]
@@ -102,9 +120,16 @@ def main():
         if [r.lower() for r in repositories] != [args.repository.lower()]:
             raise Failure(f"the token reaches {repositories}, not only {args.repository}")
         repository = call("GET", f"/repos/{owner}/{name}", token)
+        if args.keep:
+            # Created for its owner alone; one that is there already is refused, never followed or replaced.
+            descriptor = os.open(args.keep, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(token)
+            kept = True
     finally:
-        call("DELETE", "/installation/token", token, ok=(204,))
-        revoked = True
+        if not kept:
+            call("DELETE", "/installation/token", token, ok=(204,))
+            revoked = True
     print(json.dumps({
         "app_id": int(args.app_id),
         "app_slug": installation.get("app_slug"),
@@ -115,7 +140,21 @@ def main():
         "permissions": granted,
         "expires_at": made.get("expires_at"),
         "revoked": revoked,
+        **({"kept": True} if kept else {}),
     }, sort_keys=True))
+
+
+def revoke(path):
+    """Revokes the token a --keep wrote, then removes its file; a token already gone (401) is revoked."""
+    with open(path) as handle:
+        token = handle.read().strip()
+    try:
+        if not token:
+            raise Failure("the token file is empty")
+        call("DELETE", "/installation/token", token, ok=(204, 401))
+    finally:
+        os.remove(path)
+    print(json.dumps({"revoked": True}))
 
 
 if __name__ == "__main__":

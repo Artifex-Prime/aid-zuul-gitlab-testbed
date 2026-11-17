@@ -46,7 +46,8 @@ ZUUL_DB_PASSWORD=$(password)
 DB_ROOT_PASSWORD=$(password)
 ZUUL_WEBHOOK_TOKEN=$(password)
 ZUUL_GITHUB_TOKEN=$GITHUB_TOKEN
-export ZUUL_KEYSTORE_PASSWORD ZUUL_DB_PASSWORD DB_ROOT_PASSWORD ZUUL_WEBHOOK_TOKEN ZUUL_GITHUB_TOKEN
+ZUUL_ADMIN_SECRET=$(openssl rand -hex 32)
+export ZUUL_KEYSTORE_PASSWORD ZUUL_DB_PASSWORD DB_ROOT_PASSWORD ZUUL_WEBHOOK_TOKEN ZUUL_GITHUB_TOKEN ZUUL_ADMIN_SECRET
 
 echo "== keys"
 # ZooKeeper's CA and key pairs, as the deployment makes them (deploy/zuul/secrets.sh).
@@ -95,6 +96,10 @@ echo "== original GitHub pipelines and gate's write-approval requirement"
 docker run --rm --quiet -i --entrypoint python3 \
   --mount "type=bind,src=$here/original-pipelines.yaml,dst=/original-pipelines.yaml,readonly" \
   "$scheduler" - /original-pipelines.yaml < "$here/check-github-gate.py"
+echo "== bounded Kubernetes lifecycle against the pinned Zuul runtime"
+docker run --rm --quiet --entrypoint python3 \
+  --mount "type=bind,src=$root/deploy/zuul/server/launcher,dst=/bounded,readonly" \
+  "$scheduler" /bounded/test_bounded.py
 echo "== MQTT publish does not wait for AID or broker acknowledgment"
 docker run --rm --quiet -i --entrypoint python3 "$scheduler" - < "$here/check-mqtt.py"
 graphql=$(docker run --rm --quiet --entrypoint python3 "$scheduler" -c \

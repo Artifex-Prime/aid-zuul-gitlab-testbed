@@ -37,6 +37,11 @@ export GITHUB_EVENT_PATH=$ZUUL_STATE/event.json
 export GITHUB_STEP_SUMMARY=$HOME/zuul-output/logs/summary.md
 # Node's fetch through the node's proxy (#208).
 export NODE_USE_ENV_PROXY=1
+# The cluster's API, for the image check's kubectl (ci/image-run.mjs) with the post node's mounted ServiceAccount. The
+# pod has these, but sshd gives a job's session only its one SetEnv line (deploy/zuul/node/image/sshd_config), so
+# kubectl found no in-cluster config and tried localhost:8080 (#1622). By name, not the pod's IP: NO_PROXY's .svc lets
+# the name past the node's proxy, which refuses the IP.
+export KUBERNETES_SERVICE_HOST=kubernetes.default.svc KUBERNETES_SERVICE_PORT=443
 # Commits to the index branch are the App's.
 export CI_COMMIT_NAME="aid-release[bot]" CI_COMMIT_EMAIL="aid-release[bot]@users.noreply.github.com"
 
@@ -53,8 +58,6 @@ if [ -n "${CI_GITHUB_TOKEN_FILE:-}" ]; then
     '!f() { [ "$1" = get ] || exit 0; echo username=x-access-token; printf "password=%s\n" "$(cat "$CI_GITHUB_TOKEN_FILE")"; }; f'
 fi
 
-# One step's outputs, as a workflow step's `>> "$GITHUB_OUTPUT"`: `outputs <file> <command...>` empties <file>, and runs
-# the command with GITHUB_OUTPUT pointing at it and its standard output appended to it (and shown in the log).
-outputs() { local file=$1; shift; : > "$file"; GITHUB_OUTPUT=$file "$@" | tee -a "$file"; }
-# A key's value in such a file.
-output() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
+# outputs and output, and the image steps gate shares with these jobs.
+# shellcheck source=ci/zuul/steps.sh
+. ci/zuul/steps.sh

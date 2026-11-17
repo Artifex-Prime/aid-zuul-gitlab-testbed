@@ -7,9 +7,9 @@ What Zuul runs for AID (#1341, #1346), in two repositories:
   ([`deploy/zuul/job-secrets.md`](../../deploy/zuul/job-secrets.md), #1351).
 - **This folder**, AID's own project (untrusted): the job library, AID's jobs, and which pipeline runs which.
 
-Zuul's deployment, the services that run it, is [`deploy/zuul/`](../../deploy/zuul/README.md). Until Zuul's switch
-(#1355), CI stays GitHub Actions plus Mergify, and nothing here gates `main` yet: ThunderBox's tenant takes this layout
-once Zuul has its GitHub connection (#1344) and build nodes (#1345) ([On ThunderBox](#on-thunderbox)).
+Zuul's deployment is [`deploy/zuul/`](../../deploy/zuul/README.md). The cutover is held until
+the orchestrator completes [cutover.md](cutover.md); it records every live prerequisite and
+runner retirement. After that switch, Zuul alone gates main and publishes from it.
 
 | Path | What | A pull request's change to it |
 | --- | --- | --- |
@@ -17,8 +17,9 @@ once Zuul has its GitHub connection (#1344) and build nodes (#1345) ([On Thunder
 | [`zuul.d/`](zuul.d) | the job library and AID's jobs, and which pipeline runs which | runs on the pull request itself |
 | [`playbooks/`](playbooks) | the library's playbooks and their roles | runs on the pull request itself |
 | [`testbed/`](testbed) | Zuul on both, in Docker Compose, with checks | |
-| [`gate.md`](gate.md) | how `check`, `gate` and `hold` do what CI's two layers and Mergify do today, row by row | |
-| [`comparison.md`](comparison.md) | ordinary-run comparison with Actions/Mergify, reporting times and remaining coverage/rollout gaps (#1353) | |
+| [`disposable-nodes.md`](disposable-nodes.md) | fresh pods per job, fixed-namespace Kubernetes driver, caches and coordinated rollout (#1698) | |
+| [`gate.md`](gate.md) | how `check`, `gate` and `hold` admit, test and merge reviewed changes | |
+| [`comparison.md`](comparison.md) | historical ordinary-run comparison with the prior CI, reporting times and remaining coverage/rollout gaps (#1353) | |
 | [`publish.md`](publish.md) | `post` and the periodic pipelines: the app images, AID's release, the release index and the nightly on Zuul, which CI publishes (`ci/publisher`), and turning it on (#1350) | |
 | [`forge.md`](forge.md) | what moving from GitHub to another forge would touch, with Zuul staying, and one merge request through check and gate on GitLab (#1356) | |
 | [`testbed/gitlab/`](testbed/gitlab) | Zuul on GitLab CE, in Docker Compose: the pipelines' GitLab form and that merge request ([forge.md](forge.md), "The check on GitLab") | |
@@ -51,7 +52,7 @@ The base job checks the code out; AID's jobs build and test with Bazel, or run a
 in Ansible holds build logic, so that a step runs the same outside Zuul, and Zuul could be replaced without rewriting
 the steps (#1341):
 
-- **`base`** (aid-zuul-config's `zuul.d/jobs.yaml`), every job's parent: one build node of the label `aid-node`
+- **`base`** (aid-zuul-config's `zuul.d/jobs.yaml`), every job's parent: one build node of the label `aid-check-pod-node`
   (#1345), a 2-hour timeout, and a pre-run that starts the console stream (`start-zuul-console`) and puts every project
   of the job, as Zuul prepared it, into `~/src/<host>/<owner>/<repository>` (`prepare-workspace-git`). Both roles are
   Zuul's own, from `zuul/zuul-jobs`.
@@ -60,11 +61,55 @@ the steps (#1341):
 - **`aid-script`**, abstract: `./<script> <script_args>` in the checkout, where `script` is a path under `ci/` or
   `scripts/`. The role refuses any other.
 - **AID's jobs** set those variables, and nothing else that runs. `check` runs the cheap ones, the plan job's script
-  checks of CI's cheap layer (`aid-seam-lint`, `aid-seam-lint-test`, `aid-apps-lint`, `aid-apps-lint-test`), and
-  `gate` the Bazel build and test (`aid-bazel-everything`): [gate.md](gate.md). `periodic-0200` and `periodic-0300` run the nightly,
-  `aid-nightly`; what publishes from `main` is aid-zuul-config's, since each of those jobs holds a secret
-  ([publish.md](publish.md)). The [comparison](comparison.md)
-  records the remaining cheap and gate coverage gaps, tracked in #1520 and #1521 before #1355.
+  checks of CI's cheap layer (`aid-seam-lint`, `aid-seam-lint-test`, `aid-apps-lint`, `aid-apps-lint-test`) plus
+  `aid-cheap-checks` (quarantine validation, CI/workflow policy, legacy capture and affected Node suites), and
+  `gate` CI's queue run, each step a job of `aid-gate` (`./ci/zuul/gate.sh`) or the Bazel build and test
+  (`aid-bazel-everything`), those the plan of `aid-gate-plan` names: [gate.md](gate.md), "The gate's jobs".
+  `periodic-0200` and `periodic-0300` run the nightly, `aid-nightly`; what publishes from `main` is aid-zuul-config's,
+  since each of those jobs holds a secret ([publish.md](publish.md)). The [comparison](comparison.md) records the
+  cheap and gate coverage gaps of 2026-11-15, which #1520 (check's) and #1521 (gate's, these jobs) close.
+
+## Executor resources
+
+Set CPU and memory on each executor's pod/nodeset, in `deploy/zuul/` and the trusted
+`aid-zuul-config` provider definitions. Build scripts carry no node-specific jobs budget (#1695).
+Bazel's `HOST_CPUS` and `HOST_RAM` honour the node's cgroup, including for local work on a remote
+build; the farm retains its own 200-job queue and worker slot limits. The release folder's clean
+local build reads the post, image or staging node's `cpu.max` and `memory.max`, using the same
+67% RAM fraction as Bazel. See [Build resource limits](../../docs/development.md#build-resource-limits).
+
+## The cheap checks
+
+`aid-cheap-checks` calls [`cheap.mjs`](cheap.mjs) with `zuul.branch`, beside the four lint jobs in both `check` and
+`check-external`. It first runs:
+
+```sh
+bazel test --config=ci --config=zuul -- //:node_quarantine_check //:node_ci //:node_legacy
+```
+
+These are Bazel test actions on the farm, with the pinned Node runtime and the existing quarantine wrapper.
+The expiry check is uncached because its answer depends on today's date. CI test files have individual targets
+`//:node_ci_<file stem>`; `//:node_ci` groups all of them.
+
+A failed command fails the voting job before suites run. Then `ci/affected.mjs` plans the difference between
+`refs/remotes/origin/<target-branch>` and `HEAD`. Zuul preserves that remote ref as the state before the queue item's
+speculative merge ([Zuul's Git repositories](https://zuul-ci.org/docs/zuul/latest/job-content.html#git-repositories));
+it covers every commit of a rebased pull request without fetching a newer base. If the diff cannot be read, every
+Node suite runs. Unknown paths use the planner's existing full fallback.
+
+Only the plan's Node suites run, as `bazel test --config=ci --config=zuul -- //:node_<suite> ...`.
+The commands inside those actions come from [`../node-suites.json`](../node-suites.json), shared with the local
+helper. Each adapter target preserves its extraction, adapter tests and CI tests. Mock AID, lab and page script
+have targets too. An unknown suite fails closed; any failing target fails `aid/check`.
+
+Bazel owns test caching. A second unchanged run reuses Node results, except the date-sensitive quarantine check.
+Tests run from writable declared-input copies on the farm, with a private HOME and pinned Node on PATH.
+`requires-loopback` targets need the farm workers' ephemeral loopback listeners. Their shell/git/Python/OpenSSL/C
+fixtures use the workers' platform userland; no suite needs a live network service or Docker daemon.
+Gate's `aid-bazel-everything` and the nightly include these targets through `//...`; the nightly disables test caching.
+`aid-gate-quarantine-node` runs the manual, uncached `//:node_quarantine` action and copies its report from Bazel outputs.
+No Node test executes on the PR node or builder box. The script/testbed checks exercise selection and error propagation
+with fake Bazel commands; they never start another farm build from inside a test action.
 
 ## Adding or changing a job
 
@@ -133,7 +178,11 @@ Docker Compose on a GitHub-hosted runner, and checks it with ordinary pull reque
    (gate.md, "Seen working");
 11. a job with a secret, defined in the config project as `deploy/zuul/job-secrets.md` says, gets it in `post` on
     `main`: its log and its build's artifact show the fixture's SHA-256, never the value. One whose secret may not go
-    to `post` is failed by aid-zuul-config's guard, `playbooks/secrets/guard.yaml`, before its run playbook;
+    to `post` is failed by aid-zuul-config's guard, `playbooks/secrets/guard.yaml`, before its run playbook. A job
+    with an OIDC secret gets a token Zuul signed, with the claims ThunderBox's pusher checks (`sub`, `pipeline`,
+    `job-name`, `aud`, its life) and the issuer its secret names, which the tenant allows, not `[web] root` (#1637).
+    Its signature is checked against the keys at `<iss>/oidc/jwks`, as the pusher fetches them ([publish.md](publish.md),
+    "The pusher");
 12. three pull requests are refused with Zuul's own words: one that lists that job in `check` ("does not allow
     post-review job"), one with a job inheriting it ("is final and can not act as a parent"), and one with a job naming
     its secret ("Secrets must be defined in the same project in which they are used"). The workflow's token opens the
@@ -274,10 +323,13 @@ without the test bed's build node:
   - no pipeline and no base job in AID's project;
   - every playbook a job names exists under `ci/zuul/playbooks/`, and every role a playbook names exists beside it;
   - every job of AID's is `aid-bazel` or `aid-script`, or inherits one of them; every role runs only Ansible's
-    `command` and `assert`;
+    `command` and `assert`, but `gate-plan`, which only reads the plan and hands its jobs to Zuul (`slurp`,
+    `zuul_return`);
   - every script a job names is under `ci/` or `scripts/`, exists and is executable;
   - AID's one project stanza merges by rebase, runs the same jobs in `check` and `check-external`, and names in each
     pipeline only AID's jobs that run (or Zuul's `noop`);
+  - `gate` runs `aid-gate-plan`, then every job its plan can name (`node ci/zuul/gate.mjs jobs`) and no other, each
+    depending on `aid-gate-plan`, on its step's node, and only the quarantine runs not voting;
   - the test bed's node has the Bazelisk that `mise.toml` pins.
 - **The test bed** ([above](#the-test-bed)), on Zuul itself, for every change to aid-zuul-config or the test bed, and
   to see a change to the library work before Zuul runs on ThunderBox.

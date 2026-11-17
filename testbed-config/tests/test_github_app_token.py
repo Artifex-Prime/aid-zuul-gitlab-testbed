@@ -39,13 +39,15 @@ def github_fingerprint(key):
     return "SHA256:" + base64.b64encode(hashlib.sha256(der).digest()).decode()
 
 
-def run(stub, pem=PEM, app_id=stub_github.APP_ID, permissions=("contents=write",), key_file=None):
+def run(stub, pem=PEM, app_id=stub_github.APP_ID, permissions=("contents=write",), key_file=None, keep=None):
     """Runs the helper with the key on stdin, or, with key_file, in that file and nothing on stdin."""
     args = [sys.executable, "-I", HELPER, "--app-id", app_id, "--repository", stub_github.REPOSITORY]
     for permission in permissions:
         args += ["--permission", permission]
     if key_file:
         args += ["--key-file", key_file]
+    if keep:
+        args += ["--keep", keep]
     args += ["--api", stub.url]
     result = subprocess.run(args, input=None if key_file else pem, stdin=subprocess.DEVNULL if key_file else None,
                             capture_output=True, timeout=60)
@@ -184,3 +186,64 @@ class HelperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def revoke(stub, path, *extra):
+    result = subprocess.run([sys.executable, "-I", HELPER, "--revoke", path, *extra, "--api", stub.url],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    return result.returncode, result.stdout.decode(), result.stderr.decode()
+
+
+class KeepTest(unittest.TestCase):
+    """--keep and --revoke (AIDepartment#1350): a token a playbook uses, then revokes."""
+
+    assertNoSecret = HelperTest.assertNoSecret
+
+    def test_a_kept_token_is_checked_written_for_its_owner_and_not_revoked(self):
+        granted = {"contents": "write", "issues": "write"}
+        with tempfile.TemporaryDirectory() as directory, stub_github.StubGitHub(KEY.public_key(), granted=granted) as stub:
+            path = os.path.join(directory, "token")
+            status, out, err = run(stub, permissions=("contents=write", "issues=write"), keep=path)
+            self.assertEqual(status, 0, out + err)
+            self.assertEqual((json.loads(out)["revoked"], json.loads(out)["kept"]), (False, True))
+            self.assertEqual(stub.calls[1]["body"]["permissions"], {"contents": "write", "issues": "write"})
+            self.assertFalse(stub.revoked())
+            with open(path) as handle:
+                self.assertEqual(handle.read(), stub_github.TOKEN)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertNoSecret(stub, out, err)
+            status, out, err = revoke(stub, path)
+            self.assertEqual((status, json.loads(out)), (0, {"revoked": True}), out + err)
+            self.assertTrue(stub.revoked())
+            self.assertFalse(os.path.exists(path), "the token's file is removed")
+            self.assertNoSecret(stub, out, err)
+
+    def test_a_refused_grant_writes_nothing_and_revokes(self):
+        with tempfile.TemporaryDirectory() as directory, stub_github.StubGitHub(KEY.public_key(), granted={"contents": "read"}) as stub:
+            path = os.path.join(directory, "token")
+            status, out, _ = run(stub, keep=path)
+            self.assertEqual(status, 1, out)
+            self.assertTrue(stub.revoked())
+            self.assertFalse(os.path.exists(path))
+
+    def test_a_file_there_already_is_never_replaced(self):
+        with tempfile.TemporaryDirectory() as directory, stub_github.StubGitHub(KEY.public_key()) as stub:
+            path = os.path.join(directory, "token")
+            os.symlink(os.path.join(directory, "elsewhere"), path)
+            status, out, _ = run(stub, keep=path)
+            self.assertEqual(status, 1, out)
+            self.assertIn("FileExistsError", json.loads(out)["error"])
+            self.assertTrue(stub.revoked(), "the token that could not be kept is revoked")
+            self.assertFalse(os.path.exists(os.path.join(directory, "elsewhere")))
+
+    def test_revoke_removes_the_file_also_when_the_token_is_gone(self):
+        with tempfile.TemporaryDirectory() as directory, stub_github.StubGitHub(KEY.public_key()) as stub:
+            path = os.path.join(directory, "token")
+            with open(path, "w") as handle:
+                handle.write("ghs_expired")
+            status, out, err = revoke(stub, path)
+            self.assertEqual(status, 0, out + err)
+            self.assertFalse(os.path.exists(path))
+            status, out, _ = revoke(stub, path, "--app-id", "42")
+            self.assertEqual(status, 1)
+            self.assertIn("--revoke takes nothing else", json.loads(out)["error"])
